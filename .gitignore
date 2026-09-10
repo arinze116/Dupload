@@ -1,0 +1,5 @@
+node_modules/
+.env
+instagram_cookies.txt
+downloads/*
+!downloads/.gitkeep
