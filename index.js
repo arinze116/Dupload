@@ -64,6 +64,13 @@ async function withRetry(fn, options) {
       return await fn();
     } catch (err) {
       lastErr = err;
+
+      // 413 means Telegram rejected the request because the upload is too large.
+      // Retrying the same file will not fix a permanent size error.
+      if (err.message && /Request Entity Too Large|413/.test(err.message)) {
+        throw err;
+      }
+
       if (i < attempts - 1) {
         const delay = baseDelayMs * Math.pow(2, i);
         console.log(`Attempt ${i + 1} failed (${err.message}), retrying in ${delay}ms...`);
