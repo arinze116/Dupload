@@ -9,9 +9,10 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
-function runCommand(command, args) {
+function runCommand(command, args, job) {
   return new Promise((resolve, reject) => {
     const proc = spawn(command, args);
+    if (job) job.proc = proc;
     let stdout = '';
     let stderr = '';
 
@@ -19,14 +20,20 @@ function runCommand(command, args) {
     proc.stderr.on('data', (data) => (stderr += data.toString()));
 
     proc.on('close', (code) => {
-      if (code === 0) {
+      if (job && job.proc === proc) job.proc = null;
+      if (job && job.cancelled) {
+        reject(new Error('CANCELLED'));
+      } else if (code === 0) {
         resolve(stdout);
       } else {
         reject(new Error(stderr || `${command} exited with code ${code}`));
       }
     });
 
-    proc.on('error', (err) => reject(err));
+    proc.on('error', (err) => {
+      if (job && job.proc === proc) job.proc = null;
+      reject(err);
+    });
   });
 }
 
@@ -151,7 +158,7 @@ async function downloadVideo(url, jobId, job, onProgress) {
  * "download" format separately, takes only its audio, and muxes it onto
  * the already-downloaded high-quality no-watermark video.
  */
-async function fixMissingAudio(videoPath, url, jobId) {
+async function fixMissingAudio(videoPath, url, jobId, job) {
   const audioSourcePath = path.join(DOWNLOAD_DIR, `${jobId}_audiosrc.mp4`);
   const muxedPath = path.join(DOWNLOAD_DIR, `${jobId}_muxed.mp4`);
 
@@ -160,7 +167,7 @@ async function fixMissingAudio(videoPath, url, jobId) {
     '--no-playlist',
     '-o', audioSourcePath,
     url,
-  ]);
+  ], job);
 
   await runCommand('ffmpeg', [
     '-i', videoPath,
@@ -172,7 +179,7 @@ async function fixMissingAudio(videoPath, url, jobId) {
     '-shortest',
     '-y',
     muxedPath,
-  ]);
+  ], job);
 
   cleanup(videoPath);
   cleanup(audioSourcePath);
@@ -185,7 +192,7 @@ function getFileSizeMB(filePath) {
   return stats.size / (1024 * 1024);
 }
 
-async function compressVideo(inputPath, jobId) {
+async function compressVideo(inputPath, jobId, job) {
   const outputPath = path.join(DOWNLOAD_DIR, `${jobId}_compressed.mp4`);
 
   const args = [
@@ -200,11 +207,11 @@ async function compressVideo(inputPath, jobId) {
     outputPath,
   ];
 
-  await runCommand('ffmpeg', args);
+  await runCommand('ffmpeg', args, job);
   return outputPath;
 }
 
-async function downloadTikTokViaAPI(url, jobId) {
+async function downloadTikTokViaAPI(url, jobId, job) {
   const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`;
   const response = await fetch(apiUrl);
   const json = await response.json();
@@ -216,7 +223,7 @@ async function downloadTikTokViaAPI(url, jobId) {
   const videoUrl = json.data.play; // no watermark
   const outputPath = path.join(DOWNLOAD_DIR, `${jobId}.mp4`);
 
-  await runCommand('wget', ['-O', outputPath, videoUrl]);
+  await runCommand('wget', ['-O', outputPath, videoUrl], job);
   return outputPath;
 }
 
@@ -227,7 +234,7 @@ async function downloadTikTokViaAPI(url, jobId) {
 async function fetchVideo(url, jobId, job, onProgress) {
   const isTikTok = url.includes('tiktok.com') || url.includes('vm.tiktok');
 let originalPath = isTikTok
-  ? await downloadTikTokViaAPI(url, jobId)
+  ? await downloadTikTokViaAPI(url, jobId, job)
   : await downloadVideo(url, jobId, job, onProgress);
 
   if (job && job.cancelled) {
@@ -238,7 +245,7 @@ let originalPath = isTikTok
   const audioOk = await hasAudioStream(originalPath);
   if (!audioOk) {
     if (onProgress) onProgress('Fixing missing audio track...');
-    originalPath = await fixMissingAudio(originalPath, url, jobId);
+    originalPath = await fixMissingAudio(originalPath, url, jobId, job);
   }
 
   const originalSizeMB = getFileSizeMB(originalPath);
@@ -249,8 +256,14 @@ let originalPath = isTikTok
 
   if (onProgress) onProgress('Video is large, compressing to fit Telegram limits...');
 
-  const compressedPath = await compressVideo(originalPath, jobId);
+  const compressedPath = await compressVideo(originalPath, jobId, job);
   const compressedSizeMB = getFileSizeMB(compressedPath);
+
+  if (compressedSizeMB > MAX_FILE_SIZE_MB) {
+    cleanup(compressedPath);
+    cleanup(originalPath);
+    throw new Error("Unable to compress video below " + MAX_FILE_SIZE_MB + "MB limit.");
+  }
 
   fs.unlinkSync(originalPath);
 
