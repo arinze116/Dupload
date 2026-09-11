@@ -3,3 +3,6 @@ node_modules/
 instagram_cookies.txt
 downloads/*
 !downloads/.gitkeep
+
+
+youtube_cookies.txt
