@@ -142,7 +142,93 @@ function isAdmin(ctx) {
 // --- Job tracking and queue ---
 // job shape: { jobId, cancelled, proc (yt-dlp child process, if active) }
 const activeJobs = new Map();  // chatId -> job
-const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality }
+const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
+
+function parseTimestamp(value) {
+  const raw = String(value).trim();
+
+  if (!raw) return null;
+
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const seconds = Number(raw);
+    return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+  }
+
+  const parts = raw.split(':');
+
+  if (parts.length < 2 || parts.length > 3) {
+    return null;
+  }
+
+  if (parts.some((part) => !/^\d+(?:\.\d+)?$/.test(part))) {
+    return null;
+  }
+
+  let seconds;
+
+  if (parts.length === 2) {
+    const minutes = Number(parts[0]);
+    const secs = Number(parts[1]);
+
+    if (secs >= 60) return null;
+
+    seconds = minutes * 60 + secs;
+  } else {
+    const hours = Number(parts[0]);
+    const minutes = Number(parts[1]);
+    const secs = Number(parts[2]);
+
+    if (minutes >= 60 || secs >= 60) return null;
+
+    seconds = hours * 3600 + minutes * 60 + secs;
+  }
+
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
+function formatClipTimestamp(seconds) {
+  const total = Math.floor(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
+
+  return `${minutes}:${String(secs).padStart(2, '0')}`;
+}
+
+function parseClipRequest(text) {
+  const match = String(text).trim().match(
+    /^\/?clip\s+(\S+)\s+(\S+)\s+(https?:\/\/\S+)$/i
+  );
+
+  if (!match) return null;
+
+  const start = parseTimestamp(match[1]);
+  const end = parseTimestamp(match[2]);
+
+  if (start === null || end === null) {
+    return {
+      error: 'Invalid timestamp. Use seconds, MM:SS, or HH:MM:SS.',
+    };
+  }
+
+  if (end <= start) {
+    return {
+      error: 'The clip end time must be greater than the start time.',
+    };
+  }
+
+  return {
+    url: match[3],
+    start,
+    end,
+    startLabel: formatClipTimestamp(start),
+    endLabel: formatClipTimestamp(end),
+  };
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -180,7 +266,7 @@ async function withRetry(fn, options) {
  * 1. Setting job.cancelled = true
  * 2. Killing job.proc (the yt-dlp child process) if it's running
  */
-async function processJob(ctx, url, audioMode = false, quality = null) {
+async function processJob(ctx, url, audioMode = false, quality = null, clip = null) {
   const chatId = ctx.chat.id;
   const jobId = crypto.randomBytes(6).toString('hex');
   const job = { jobId, cancelled: false, proc: null };
@@ -193,9 +279,11 @@ async function processJob(ctx, url, audioMode = false, quality = null) {
   const statusMsg = await ctx.reply(
     audioMode
       ? `Extracting audio${platformStr}...`
-      : quality
-        ? `Fetching your video${platformStr} at ${quality}...`
-        : `Fetching your video${platformStr}, this can take a moment depending on size and quality.`
+      : clip
+        ? `Fetching clip${platformStr} (${clip.startLabel} → ${clip.endLabel})...`
+        : quality
+          ? `Fetching your video${platformStr} at ${quality}...`
+          : `Fetching your video${platformStr}, this can take a moment depending on size and quality.`
   );
 
   // Helper to safely edit the status message
@@ -220,7 +308,15 @@ async function processJob(ctx, url, audioMode = false, quality = null) {
       return;
     }
 
-    result = await fetchVideo(url, jobId, job, onProgress, audioMode, quality);
+    result = await fetchVideo(
+      url,
+      jobId,
+      job,
+      onProgress,
+      audioMode,
+      quality,
+      clip
+    );
 
     if (job.cancelled) {
       cleanup(result && result.filePath);
@@ -238,7 +334,26 @@ async function processJob(ctx, url, audioMode = false, quality = null) {
 
     analytics.finishDownload(analyticsDownloadId, 'failed');
     console.error(`[${jobId}] Download failed:`, err.message);
-    await updateStatus('Could not download that video. The link may be private, region-locked, or from an unsupported platform.');
+
+    if (err.message === 'CLIP_AUDIO_UNSUPPORTED') {
+      await updateStatus(
+        'Audio-only clips are not supported yet. Use a video clip request instead.'
+      );
+      return;
+    }
+
+    if (err.message && err.message.startsWith('CLIP_END_EXCEEDS_DURATION:')) {
+      const duration = Number(err.message.split(':')[1]);
+
+      await updateStatus(
+        `The requested clip ends after the video. Video duration: ${formatClipTimestamp(duration)}.`
+      );
+      return;
+    }
+
+    await updateStatus(
+      'Could not download that video. The link may be private, region-locked, or from an unsupported platform.'
+    );
     return;
   }
 
@@ -279,9 +394,9 @@ async function runQueue(chatId) {
   const queue = jobQueues.get(chatId) || [];
 
   while (queue.length > 0) {
-    const { url, ctx, audioMode, quality } = queue.shift();
+    const { url, ctx, audioMode, quality, clip } = queue.shift();
     try {
-      await processJob(ctx, url, audioMode, quality);
+      await processJob(ctx, url, audioMode, quality, clip);
     } catch (err) {
       console.error('Unhandled error in processJob:', err.message);
     } finally {
@@ -304,6 +419,49 @@ bot.help((ctx) => {
   ctx.reply(
     "Paste any video link and I'll fetch the best quality available.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading"
   );
+});
+
+bot.command('clip', async (ctx) => {
+  const request = parseClipRequest(ctx.message.text);
+
+  if (!request) {
+    return ctx.reply(
+      'Usage: /clip <start> <end> <url>\nExample: /clip 00:30 01:15 https://youtu.be/xxxxx'
+    );
+  }
+
+  if (request.error) {
+    return ctx.reply(request.error);
+  }
+
+  const userId = ctx.from.id;
+
+  if (isRateLimited(userId)) {
+    return ctx.reply(
+      `You've reached the limit of ${RATE_LIMIT_PER_HOUR} downloads per hour. Please wait before sending more links.`
+    );
+  }
+
+  const chatId = ctx.chat.id;
+  const queue = jobQueues.get(chatId) || [];
+
+  queue.push({
+    url: request.url,
+    ctx,
+    audioMode: false,
+    quality: null,
+    clip: request,
+  });
+
+  jobQueues.set(chatId, queue);
+
+  if (activeJobs.has(chatId)) {
+    return ctx.reply(
+      `Clip added to queue (position ${queue.length}). Send /stop to cancel the current download.`
+    );
+  }
+
+  runQueue(chatId);
 });
 
 bot.command('stop', (ctx) => {
@@ -453,13 +611,30 @@ bot.command('cleardownloads', (ctx) => {
 
 bot.on('text', async (ctx) => {
   const text = ctx.message.text;
+  const clipRequest = parseClipRequest(text);
+
+  if (/^\/?clip\b/i.test(text.trim())) {
+    if (!clipRequest) {
+      return ctx.reply(
+        'Usage: clip <start> <end> <url>\nExample: clip 00:30 01:15 https://youtu.be/xxxxx'
+      );
+    }
+
+    if (clipRequest.error) {
+      return ctx.reply(clipRequest.error);
+    }
+  }
+
   const match = text.match(URL_REGEX);
 
   if (!match) {
-    return ctx.reply("That doesn't look like a link. Paste a video URL from a supported platform.");
+    return ctx.reply(
+      "That doesn't look like a link. Paste a video URL from a supported platform."
+    );
   }
 
   const userId = ctx.from.id;
+
   if (isRateLimited(userId)) {
     return ctx.reply(
       `You've reached the limit of ${RATE_LIMIT_PER_HOUR} downloads per hour. Please wait before sending more links.`
@@ -470,21 +645,27 @@ bot.on('text', async (ctx) => {
   const audioMode = /\baudio\b/i.test(text);
   const qualityMatch = text.match(/\b(360p|480p|720p|1080p)\b/i);
   const quality = qualityMatch ? qualityMatch[1].toLowerCase() : null;
+  const clip = clipRequest;
 
   const chatId = ctx.chat.id;
   const isActive = activeJobs.has(chatId);
   const queue = jobQueues.get(chatId) || [];
 
   if (isActive) {
-    queue.push({ url, ctx, audioMode, quality });
+    queue.push({ url, ctx, audioMode, quality, clip });
     jobQueues.set(chatId, queue);
-    return ctx.reply(`Added to queue (position ${queue.length}). Send /stop to cancel the current download.`);
+
+    return ctx.reply(
+      `Added to queue (position ${queue.length}). Send /stop to cancel the current download.`
+    );
   }
 
-  queue.push({ url, ctx, audioMode, quality });
+  queue.push({ url, ctx, audioMode, quality, clip });
   jobQueues.set(chatId, queue);
+
   runQueue(chatId);
 });
+
 
 bot.launch({ dropPendingUpdates: true });
 console.log('Bot is running.');

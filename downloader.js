@@ -308,6 +308,76 @@ function getFileSizeMB(filePath) {
   return stats.size / (1024 * 1024);
 }
 
+async function getMediaDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filePath,
+    ]);
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        return reject(new Error(stderr || 'ffprobe duration check failed'));
+      }
+
+      const duration = parseFloat(stdout.trim());
+
+      if (!Number.isFinite(duration) || duration < 0) {
+        return reject(new Error('Could not determine media duration.'));
+      }
+
+      resolve(duration);
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+async function clipVideo(inputPath, jobId, job, startSeconds, endSeconds) {
+  const outputPath = path.join(DOWNLOAD_DIR, `${jobId}_clip.mp4`);
+  const duration = endSeconds - startSeconds;
+
+  try {
+    await runCommand('ffmpeg', [
+      '-ss', String(startSeconds),
+      '-i', inputPath,
+      '-t', String(duration),
+      '-map', '0:v:0',
+      '-map', '0:a:0',
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      '-y',
+      outputPath,
+    ], job);
+
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('Clip was created but no output file was found.');
+    }
+
+    return outputPath;
+  } catch (err) {
+    cleanup(outputPath);
+    throw err;
+  }
+}
+
 async function compressVideo(inputPath, jobId, job) {
   const outputPath = path.join(DOWNLOAD_DIR, `${jobId}_compressed.mp4`);
 
@@ -391,18 +461,38 @@ async function getVideoInfo(url) {
  * Full pipeline: download, fix audio if needed, then compress if needed.
  * Returns { filePath, wasCompressed, finalSizeMB }
  */
-async function fetchVideo(url, jobId, job, onProgress, audioMode = false, quality = null) {
+async function fetchVideo(
+  url,
+  jobId,
+  job,
+  onProgress,
+  audioMode = false,
+  quality = null,
+  clip = null
+) {
   if (audioMode) {
+    if (clip) {
+      throw new Error('CLIP_AUDIO_UNSUPPORTED');
+    }
+
     const audioPath = await downloadAudio(url, jobId, job, onProgress);
+
     if (job && job.cancelled) {
       cleanup(audioPath);
       throw new Error('CANCELLED');
     }
+
     const sizeMB = getFileSizeMB(audioPath);
-    return { filePath: audioPath, wasCompressed: false, finalSizeMB: sizeMB };
+
+    return {
+      filePath: audioPath,
+      wasCompressed: false,
+      finalSizeMB: sizeMB,
+    };
   }
 
   const isTikTok = url.includes('tiktok.com') || url.includes('vm.tiktok');
+
   let originalPath = isTikTok
     ? await downloadTikTokViaAPI(url, jobId, job)
     : await downloadVideo(url, jobId, job, onProgress, quality);
@@ -413,18 +503,66 @@ async function fetchVideo(url, jobId, job, onProgress, audioMode = false, qualit
   }
 
   const audioOk = await hasAudioStream(originalPath);
+
   if (!audioOk) {
-    if (onProgress) onProgress('Fixing missing audio track...');
+    if (onProgress) {
+      onProgress('Fixing missing audio track...');
+    }
+
     originalPath = await fixMissingAudio(originalPath, url, jobId, job);
+  }
+
+  if (clip) {
+    const sourcePath = originalPath;
+
+    try {
+      const mediaDuration = await getMediaDuration(sourcePath);
+
+      if (clip.end > mediaDuration + 0.5) {
+        throw new Error(
+          `CLIP_END_EXCEEDS_DURATION:${mediaDuration.toFixed(2)}`
+        );
+      }
+
+      if (job && job.cancelled) {
+        throw new Error('CANCELLED');
+      }
+
+      if (onProgress) {
+        onProgress(
+          `Creating clip ${clip.startLabel} → ${clip.endLabel}...`
+        );
+      }
+
+      const clippedPath = await clipVideo(
+        sourcePath,
+        jobId,
+        job,
+        clip.start,
+        clip.end
+      );
+
+      cleanup(sourcePath);
+      originalPath = clippedPath;
+    } catch (err) {
+      cleanup(sourcePath);
+      throw err;
+    }
   }
 
   const originalSizeMB = getFileSizeMB(originalPath);
 
   if (originalSizeMB <= MAX_FILE_SIZE_MB) {
-    return { filePath: originalPath, wasCompressed: false, finalSizeMB: originalSizeMB };
+    return {
+      filePath: originalPath,
+      wasCompressed: false,
+      finalSizeMB: originalSizeMB,
+    };
   }
 
-  if (onProgress) onProgress('Video is large, compressing to fit Telegram limits...');
+  if (onProgress) {
+    onProgress('Video is large, compressing to fit Telegram limits...');
+  }
 
   const compressedPath = await compressVideo(originalPath, jobId, job);
   const compressedSizeMB = getFileSizeMB(compressedPath);
@@ -432,10 +570,13 @@ async function fetchVideo(url, jobId, job, onProgress, audioMode = false, qualit
   if (compressedSizeMB > MAX_FILE_SIZE_MB) {
     cleanup(compressedPath);
     cleanup(originalPath);
-    throw new Error("Unable to compress video below " + MAX_FILE_SIZE_MB + "MB limit.");
+
+    throw new Error(
+      "Unable to compress video below " + MAX_FILE_SIZE_MB + "MB limit."
+    );
   }
 
-  fs.unlinkSync(originalPath);
+  cleanup(originalPath);
 
   return {
     filePath: compressedPath,
@@ -454,4 +595,11 @@ function cleanup(filePath) {
   }
 }
 
-module.exports = { fetchVideo, downloadAudio, getVideoInfo, getFileSizeMB, cleanup, MAX_FILE_SIZE_MB };
+module.exports = {
+  fetchVideo,
+  downloadAudio,
+  getVideoInfo,
+  getFileSizeMB,
+  cleanup,
+  MAX_FILE_SIZE_MB,
+};
