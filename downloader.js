@@ -9,6 +9,28 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
+function buildProgressBar(pct) {
+  const filled = Math.floor(pct / 10);
+  const empty = 10 - filled;
+  return '▓'.repeat(filled) + '░'.repeat(empty);
+}
+
+function qualityToFormatSelector(quality) {
+  const heightMap = { '360p': 360, '480p': 480, '720p': 720, '1080p': 1080 };
+  const h = heightMap[quality];
+  if (!h) return null;
+  // Prefer h264 at the requested height; fall back to any codec at that height;
+  // fall back to best available below that height
+  return (
+    `bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]` +
+    `/bestvideo[height<=${h}][vcodec^=avc]+bestaudio` +
+    `/bestvideo[height<=${h}]+bestaudio` +
+    `/best[height<=${h}]` +
+    `/bestvideo+bestaudio` +
+    `/best`
+  );
+}
+
 function runCommand(command, args, job) {
   return new Promise((resolve, reject) => {
     const proc = spawn(command, args);
@@ -66,21 +88,18 @@ function hasAudioStream(filePath) {
  * @param {string} jobId
  * @param {object} job - job object with a `cancelled` flag and optional `proc` reference
  * @param {function} onProgress - called periodically with a status string during download
+ * @param {string|null} quality - optional resolution request (e.g. '720p')
  */
-async function downloadVideo(url, jobId, job, onProgress) {
+async function downloadVideo(url, jobId, job, onProgress, quality = null) {
   const outputTemplate = path.join(DOWNLOAD_DIR, `${jobId}.%(ext)s`);
 
-  // Format selector priority:
-  // 1. h264 video + m4a audio (cleanest merge, works on Facebook, Instagram)
-  // 2. h264 video + any audio
-  // 3. best video + best audio (covers Reddit, TikTok, Twitter/X, YouTube, etc.)
-  // 4. best single pre-muxed stream (last resort)
-  // Note: on TikTok this sometimes grabs a variant with audio metadata but
-  // no real audio track — handled downstream by hasAudioStream + fixMissingAudio.
   const isTikTok = url.includes('tiktok.com') || url.includes('vm.tiktok');
+  const formatSelector = quality
+    ? qualityToFormatSelector(quality)
+    : 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best';
 
   const args = [
-    '-f', 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best',
+    '-f', formatSelector,
     '--no-playlist',
     '--merge-output-format', 'mp4',
     '--newline',
@@ -95,29 +114,41 @@ async function downloadVideo(url, jobId, job, onProgress) {
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', args);
 
-    // Store proc reference on the job so /stop can kill it directly
     if (job) job.proc = proc;
 
     let stderr = '';
+    let lastProgressUpdate = 0;
+    let lastPct = 0;
     let progressTimer = null;
 
-    // Send a periodic "still working" update every 15 seconds
     if (onProgress) {
       progressTimer = setInterval(() => {
         if (job && job.cancelled) return;
-        onProgress('Still downloading, please wait...');
-      }, 15000);
+        const now = Date.now();
+        if (now - lastProgressUpdate > 20000) {
+          onProgress('Still downloading, please wait...');
+          lastProgressUpdate = now;
+        }
+      }, 20000);
     }
 
     proc.stdout.on('data', (data) => {
-      const line = data.toString();
-      // Parse yt-dlp's --newline progress output for percentage
-      const match = line.match(/(\d+\.\d+)%/);
-      if (match && onProgress) {
-        const pct = parseFloat(match[1]);
-        // Only report at rough milestones to avoid spamming
-        if (pct === 25 || pct === 50 || pct === 75) {
-          onProgress(`Downloading... ${Math.floor(pct)}% complete`);
+      const lines = data.toString().split('\n');
+      for (const line of lines) {
+        const match = line.match(/(\d+\.?\d*)%\s+of\s+~?([\d.]+)(MiB|GiB)/);
+        if (match && onProgress) {
+          const pct = parseFloat(match[1]);
+          const size = parseFloat(match[2]);
+          const unit = match[3];
+          const now = Date.now();
+
+          if (now - lastProgressUpdate >= 5000 || pct >= 99) {
+            lastPct = pct;
+            lastProgressUpdate = now;
+
+            const bar = buildProgressBar(pct);
+            onProgress(`Downloading...\n${bar} ${Math.floor(pct)}%\nSize: ~${size} ${unit}`);
+          }
         }
       }
     });
@@ -142,6 +173,91 @@ async function downloadVideo(url, jobId, job, onProgress) {
         resolve(path.join(DOWNLOAD_DIR, files[0]));
       } else {
         reject(new Error(stderr || `yt-dlp exited with code ${code}`));
+      }
+    });
+
+    proc.on('error', (err) => {
+      if (progressTimer) clearInterval(progressTimer);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Downloads audio-only format from URL as MP3.
+ */
+async function downloadAudio(url, jobId, job, onProgress) {
+  const outputPath = path.join(DOWNLOAD_DIR, `${jobId}.mp3`);
+
+  const args = [
+    '-f', 'bestaudio',
+    '--no-playlist',
+    '--extract-audio',
+    '--audio-format', 'mp3',
+    '--audio-quality', '0',
+    '--newline',
+    '-o', outputPath,
+    url,
+  ];
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', args);
+    if (job) job.proc = proc;
+
+    let stderr = '';
+    let lastProgressUpdate = 0;
+    let lastPct = 0;
+    let progressTimer = null;
+
+    if (onProgress) {
+      progressTimer = setInterval(() => {
+        if (job && job.cancelled) return;
+        const now = Date.now();
+        if (now - lastProgressUpdate > 20000) {
+          onProgress('Still extracting audio, please wait...');
+          lastProgressUpdate = now;
+        }
+      }, 20000);
+    }
+
+    proc.stdout.on('data', (data) => {
+      const lines = data.toString().split('\n');
+      for (const line of lines) {
+        const match = line.match(/(\d+\.?\d*)%\s+of\s+~?([\d.]+)(MiB|GiB)/);
+        if (match && onProgress) {
+          const pct = parseFloat(match[1]);
+          const size = parseFloat(match[2]);
+          const unit = match[3];
+          const now = Date.now();
+
+          if (now - lastProgressUpdate >= 5000 || pct >= 99) {
+            lastPct = pct;
+            lastProgressUpdate = now;
+
+            const bar = buildProgressBar(pct);
+            onProgress(`Extracting audio...\n${bar} ${Math.floor(pct)}%\nSize: ~${size} ${unit}`);
+          }
+        }
+      }
+    });
+
+    proc.stderr.on('data', (data) => (stderr += data.toString()));
+
+    proc.on('close', (code) => {
+      if (progressTimer) clearInterval(progressTimer);
+      if (job) job.proc = null;
+
+      if (job && job.cancelled) return reject(new Error('CANCELLED'));
+
+      if (code === 0) {
+        // yt-dlp may append .mp3 to the output path or not — find it
+        const files = fs.readdirSync(DOWNLOAD_DIR).filter(
+          (f) => f.startsWith(jobId) && f.endsWith('.mp3') && !f.endsWith('.part')
+        );
+        if (files.length === 0) return reject(new Error('Audio extraction completed but no MP3 found.'));
+        resolve(path.join(DOWNLOAD_DIR, files[0]));
+      } else {
+        reject(new Error(stderr || `yt-dlp audio exited with code ${code}`));
       }
     });
 
@@ -228,14 +344,68 @@ async function downloadTikTokViaAPI(url, jobId, job) {
 }
 
 /**
+ * Fetches video details without downloading media files.
+ */
+async function getVideoInfo(url) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', [
+      '--dump-json',
+      '--no-playlist',
+      '--no-download',
+      url,
+    ]);
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d.toString()));
+    proc.stderr.on('data', (d) => (stderr += d.toString()));
+
+    proc.on('close', (code) => {
+      if (code !== 0) return reject(new Error(stderr || 'yt-dlp info failed'));
+
+      try {
+        const data = JSON.parse(stdout);
+        // Extract unique height values from formats, filter nulls, sort descending
+        const heights = [...new Set(
+          (data.formats || [])
+            .map((f) => f.height)
+            .filter(Boolean)
+        )].sort((a, b) => b - a);
+
+        resolve({
+          title: data.title || 'Unknown',
+          uploader: data.uploader || data.channel || null,
+          duration: data.duration || null,
+          formats: heights.length > 0 ? heights.map((h) => `${h}p`) : ['unknown'],
+        });
+      } catch (e) {
+        reject(new Error('Failed to parse video info'));
+      }
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+/**
  * Full pipeline: download, fix audio if needed, then compress if needed.
  * Returns { filePath, wasCompressed, finalSizeMB }
  */
-async function fetchVideo(url, jobId, job, onProgress) {
+async function fetchVideo(url, jobId, job, onProgress, audioMode = false, quality = null) {
+  if (audioMode) {
+    const audioPath = await downloadAudio(url, jobId, job, onProgress);
+    if (job && job.cancelled) {
+      cleanup(audioPath);
+      throw new Error('CANCELLED');
+    }
+    const sizeMB = getFileSizeMB(audioPath);
+    return { filePath: audioPath, wasCompressed: false, finalSizeMB: sizeMB };
+  }
+
   const isTikTok = url.includes('tiktok.com') || url.includes('vm.tiktok');
-let originalPath = isTikTok
-  ? await downloadTikTokViaAPI(url, jobId, job)
-  : await downloadVideo(url, jobId, job, onProgress);
+  let originalPath = isTikTok
+    ? await downloadTikTokViaAPI(url, jobId, job)
+    : await downloadVideo(url, jobId, job, onProgress, quality);
 
   if (job && job.cancelled) {
     cleanup(originalPath);
@@ -284,4 +454,4 @@ function cleanup(filePath) {
   }
 }
 
-module.exports = { fetchVideo, getFileSizeMB, cleanup, MAX_FILE_SIZE_MB };
+module.exports = { fetchVideo, downloadAudio, getVideoInfo, getFileSizeMB, cleanup, MAX_FILE_SIZE_MB };
