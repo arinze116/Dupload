@@ -73,6 +73,9 @@ const bot = new Telegraf(BOT_TOKEN, {
   },
 });
 
+// Recover analytics records left in progress by a previous bot process.
+analytics.recoverStaleDownloads();
+
 const URL_REGEX = /(https?:\/\/[^\s]+)/i;
 
 // Track every Telegram user who interacts with the bot.
@@ -387,10 +390,16 @@ bot.command('stats', (ctx) => {
 
   try {
     const stats = analytics.getStats();
-    const totalGB = (stats.totalDataMB / 1024).toFixed(2);
+
+    const totalGB = stats.totalDataMB >= 1024
+      ? `${(stats.totalDataMB / 1024).toFixed(2)} GB`
+      : `${stats.totalDataMB.toFixed(2)} MB`;
 
     const activeCount = activeJobs.size;
-    const queuedCount = [...jobQueues.values()].reduce((sum, q) => sum + q.length, 0);
+    const queuedCount = [...jobQueues.values()].reduce(
+      (sum, q) => sum + q.length,
+      0
+    );
 
     ctx.reply(
       `📊 Dupload Stats\n\n` +
@@ -403,16 +412,19 @@ bot.command('stats', (ctx) => {
       `Active this week: ${stats.activeThisWeek}\n` +
       `Active this month: ${stats.activeThisMonth}\n\n` +
       `Downloads\n` +
-      `Total: ${stats.totalDownloads}\n` +
+      `Total attempts: ${stats.totalDownloads}\n` +
       `Successful: ${stats.successfulDownloads}\n` +
       `Failed: ${stats.failedDownloads}\n` +
-      `Cancelled: ${stats.cancelledDownloads}\n\n` +
-      `Data processed\n` +
-      `${totalGB} GB\n\n` +
+      `Cancelled: ${stats.cancelledDownloads}\n` +
+      `Interrupted: ${stats.interruptedDownloads}\n` +
+      `In progress: ${stats.inProgressDownloads}\n\n` +
+      `Data delivered\n` +
+      `${totalGB}\n\n` +
       `Runtime\n` +
       `Active jobs: ${activeCount}\n` +
       `Queued jobs: ${queuedCount}\n` +
-      `Rate limit: ${RATE_LIMIT_PER_HOUR}/hour per user`
+      `Rate limit: ${RATE_LIMIT_PER_HOUR}/hour per user\n\n` +
+      `Timezone: ${stats.timezone}`
     );
   } catch (err) {
     console.error('Stats command failed:', err.message);
