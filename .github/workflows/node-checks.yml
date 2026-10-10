@@ -24,5 +24,8 @@ jobs:
           node --check index.js
           node --check downloader.js
           node --check analytics.js
+          node --check global-semaphore.js
+      - name: Run concurrency regression tests
+        run: node --test tests/*.test.js
       - name: Audit production dependencies
         run: npm audit --omit=dev
