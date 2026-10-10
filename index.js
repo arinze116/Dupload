@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const { fetchVideo, downloadAudio, getVideoInfo, cleanup, MAX_FILE_SIZE_MB } = require('./downloader');
+const { createSemaphore } = require('./global-semaphore');
 const analytics = require('./analytics');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -143,6 +144,16 @@ function isAdmin(ctx) {
 // job shape: { jobId, cancelled, proc (yt-dlp child process, if active) }
 const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
+const MAX_QUEUED_PER_CHAT = 5;
+const MAX_QUEUED_GLOBAL = 30;
+const MAX_ACTIVE_GLOBAL = 3;
+const globalSemaphore = createSemaphore(MAX_ACTIVE_GLOBAL);
+const runningQueues = new Set();
+
+function queueAtCapacity(chatId) {
+  const totalQueued = [...jobQueues.values()].reduce((total, queue) => total + queue.length, 0);
+  return (jobQueues.get(chatId) || []).length >= MAX_QUEUED_PER_CHAT || totalQueued >= MAX_QUEUED_GLOBAL;
+}
 
 function parseTimestamp(value) {
   const raw = String(value).trim();
@@ -388,23 +399,45 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
 }
 
 /**
- * Runs the queue for a chat, one job at a time.
+ * Runs one queue per chat, while a shared semaphore caps process-wide work.
+ * Queue items remain queued until a global slot is available, so queue limits
+ * include jobs waiting for capacity.
  */
 async function runQueue(chatId) {
+  if (runningQueues.has(chatId)) return;
+  runningQueues.add(chatId);
   const queue = jobQueues.get(chatId) || [];
 
-  while (queue.length > 0) {
-    const { url, ctx, audioMode, quality, clip } = queue.shift();
-    try {
-      await processJob(ctx, url, audioMode, quality, clip);
-    } catch (err) {
-      console.error('Unhandled error in processJob:', err.message);
-    } finally {
-      activeJobs.delete(chatId);
+  try {
+    while (queue.length > 0) {
+      const releaseSlot = await globalSemaphore.acquire();
+
+      // /stop can clear a queue while its runner is waiting for a global slot.
+      if (queue.length === 0) {
+        releaseSlot();
+        break;
+      }
+
+      const { url, ctx, audioMode, quality, clip } = queue.shift();
+      try {
+        await processJob(ctx, url, audioMode, quality, clip);
+      } catch (err) {
+        console.error('Unhandled error in processJob:', err.message);
+      } finally {
+        activeJobs.delete(chatId);
+        releaseSlot();
+      }
+    }
+  } finally {
+    runningQueues.delete(chatId);
+    if (jobQueues.get(chatId) === queue) {
+      jobQueues.delete(chatId);
+    }
+    // Cover a new item arriving at the boundary of runner shutdown.
+    if ((jobQueues.get(chatId) || []).length > 0) {
+      void runQueue(chatId);
     }
   }
-
-  jobQueues.delete(chatId);
 }
 
 // --- Commands ---
@@ -444,6 +477,9 @@ bot.command('clip', async (ctx) => {
 
   const chatId = ctx.chat.id;
   const queue = jobQueues.get(chatId) || [];
+  if (queueAtCapacity(chatId)) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
+  }
 
   queue.push({
     url: request.url,
@@ -455,7 +491,7 @@ bot.command('clip', async (ctx) => {
 
   jobQueues.set(chatId, queue);
 
-  if (activeJobs.has(chatId)) {
+  if (runningQueues.has(chatId)) {
     return ctx.reply(
       `Clip added to queue (position ${queue.length}). Send /stop to cancel the current download.`
     );
@@ -469,7 +505,7 @@ bot.command('stop', (ctx) => {
   const job = activeJobs.get(chatId);
   const queue = jobQueues.get(chatId) || [];
 
-  if (!job && queue.length === 0) {
+  if (!job && queue.length === 0 && !runningQueues.has(chatId)) {
     return ctx.reply('No active download to stop.');
   }
 
@@ -485,8 +521,10 @@ bot.command('stop', (ctx) => {
     }
   }
 
-  // Clear the queue
-  jobQueues.set(chatId, []);
+  // Mutate the queue array the runner is consuming, so /stop also cancels
+  // queued items when that runner is waiting for a global concurrency slot.
+  queue.length = 0;
+  jobQueues.set(chatId, queue);
 
   const queueMsg = queue.length > 0 ? ` and cleared ${queue.length} queued link(s)` : '';
   ctx.reply(`Download stopped${queueMsg}.`);
@@ -648,10 +686,13 @@ bot.on('text', async (ctx) => {
   const clip = clipRequest;
 
   const chatId = ctx.chat.id;
-  const isActive = activeJobs.has(chatId);
+  const isActive = runningQueues.has(chatId);
   const queue = jobQueues.get(chatId) || [];
 
   if (isActive) {
+    if (queueAtCapacity(chatId)) {
+      return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
+    }
     queue.push({ url, ctx, audioMode, quality, clip });
     jobQueues.set(chatId, queue);
 
@@ -660,6 +701,9 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  if (queueAtCapacity(chatId)) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat). Try again after a job finishes.`);
+  }
   queue.push({ url, ctx, audioMode, quality, clip });
   jobQueues.set(chatId, queue);
 
