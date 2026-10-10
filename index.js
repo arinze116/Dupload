@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const { fetchVideo, downloadAudio, getVideoInfo, cleanup, MAX_FILE_SIZE_MB } = require('./downloader');
+const { createSemaphore } = require('./global-semaphore');
 const analytics = require('./analytics');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -146,30 +147,8 @@ const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, qual
 const MAX_QUEUED_PER_CHAT = 5;
 const MAX_QUEUED_GLOBAL = 30;
 const MAX_ACTIVE_GLOBAL = 3;
-let activeGlobalJobs = 0;
-const globalSlotWaiters = [];
+const globalSemaphore = createSemaphore(MAX_ACTIVE_GLOBAL);
 const runningQueues = new Set();
-
-function acquireGlobalSlot() {
-  if (activeGlobalJobs < MAX_ACTIVE_GLOBAL) {
-    activeGlobalJobs++;
-    return Promise.resolve();
-  }
-
-  return new Promise((resolve) => {
-    globalSlotWaiters.push(resolve);
-  });
-}
-
-function releaseGlobalSlot() {
-  const next = globalSlotWaiters.shift();
-  if (next) {
-    // Transfer the occupied slot directly to the next waiter.
-    next();
-  } else {
-    activeGlobalJobs = Math.max(0, activeGlobalJobs - 1);
-  }
-}
 
 function queueAtCapacity(chatId) {
   const totalQueued = [...jobQueues.values()].reduce((total, queue) => total + queue.length, 0);
@@ -431,11 +410,11 @@ async function runQueue(chatId) {
 
   try {
     while (queue.length > 0) {
-      await acquireGlobalSlot();
+      const releaseSlot = await globalSemaphore.acquire();
 
       // /stop can clear a queue while its runner is waiting for a global slot.
       if (queue.length === 0) {
-        releaseGlobalSlot();
+        releaseSlot();
         break;
       }
 
@@ -446,7 +425,7 @@ async function runQueue(chatId) {
         console.error('Unhandled error in processJob:', err.message);
       } finally {
         activeJobs.delete(chatId);
-        releaseGlobalSlot();
+        releaseSlot();
       }
     }
   } finally {
