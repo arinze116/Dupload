@@ -145,6 +145,8 @@ const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
 const MAX_QUEUED_PER_CHAT = 5;
 const MAX_QUEUED_GLOBAL = 30;
+const MAX_ACTIVE_GLOBAL = 3;
+let activeGlobalJobs = 0;
 
 function queueAtCapacity(chatId) {
   const totalQueued = [...jobQueues.values()].reduce((total, queue) => total + queue.length, 0);
