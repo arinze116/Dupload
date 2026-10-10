@@ -144,9 +144,11 @@ function isAdmin(ctx) {
 const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
 const MAX_QUEUED_PER_CHAT = 5;
+const MAX_QUEUED_GLOBAL = 30;
 
 function queueAtCapacity(chatId) {
-  return (jobQueues.get(chatId) || []).length >= MAX_QUEUED_PER_CHAT;
+  const totalQueued = [...jobQueues.values()].reduce((total, queue) => total + queue.length, 0);
+  return (jobQueues.get(chatId) || []).length >= MAX_QUEUED_PER_CHAT || totalQueued >= MAX_QUEUED_GLOBAL;
 }
 
 function parseTimestamp(value) {
