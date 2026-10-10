@@ -143,6 +143,11 @@ function isAdmin(ctx) {
 // job shape: { jobId, cancelled, proc (yt-dlp child process, if active) }
 const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
+const MAX_QUEUED_PER_CHAT = 5;
+
+function queueAtCapacity(chatId) {
+  return (jobQueues.get(chatId) || []).length >= MAX_QUEUED_PER_CHAT;
+}
 
 function parseTimestamp(value) {
   const raw = String(value).trim();
@@ -444,6 +449,9 @@ bot.command('clip', async (ctx) => {
 
   const chatId = ctx.chat.id;
   const queue = jobQueues.get(chatId) || [];
+  if (queue.length >= MAX_QUEUED_PER_CHAT) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat). Try again after a job finishes.`);
+  }
 
   queue.push({
     url: request.url,
@@ -652,6 +660,9 @@ bot.on('text', async (ctx) => {
   const queue = jobQueues.get(chatId) || [];
 
   if (isActive) {
+    if (queueAtCapacity(chatId)) {
+      return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat). Try again after a job finishes.`);
+    }
     queue.push({ url, ctx, audioMode, quality, clip });
     jobQueues.set(chatId, queue);
 
@@ -660,6 +671,9 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  if (queueAtCapacity(chatId)) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat). Try again after a job finishes.`);
+  }
   queue.push({ url, ctx, audioMode, quality, clip });
   jobQueues.set(chatId, queue);
 
