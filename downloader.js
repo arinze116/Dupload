@@ -138,6 +138,7 @@ async function downloadVideo(url, jobId, job, onProgress, quality = null) {
     : 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best';
 
   const args = [
+    '--remote-components', 'ejs:github',
     '-f', formatSelector,
     '--no-playlist',
     '--merge-output-format', 'mp4',
@@ -230,6 +231,7 @@ async function downloadAudio(url, jobId, job, onProgress) {
   const outputPath = path.join(DOWNLOAD_DIR, `${jobId}.mp3`);
 
   const args = [
+    '--remote-components', 'ejs:github',
     '-f', 'bestaudio',
     '--no-playlist',
     '--extract-audio',
@@ -323,6 +325,7 @@ async function fixMissingAudio(videoPath, url, jobId, job) {
   const muxedPath = path.join(DOWNLOAD_DIR, `${jobId}_muxed.mp4`);
 
   await runCommand('yt-dlp', [
+    '--remote-components', 'ejs:github',
     '-f', 'download',
     '--no-playlist',
     '-o', audioSourcePath,
@@ -477,6 +480,7 @@ async function downloadTikTokViaAPI(url, jobId, job) {
 async function getVideoInfo(url) {
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', [
+      '--remote-components', 'ejs:github',
       '--dump-json',
       '--no-playlist',
       '--no-download',
