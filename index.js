@@ -314,15 +314,28 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
   const platform = detectPlatform(url);
   const platformStr = platform ? ` from ${platform}` : '';
 
-  const statusMsg = await ctx.reply(
-    audioMode
-      ? `Extracting audio${platformStr}...`
-      : clip
-        ? `Fetching clip${platformStr} (${clip.startLabel} → ${clip.endLabel})...`
-        : quality
-          ? `Fetching your video${platformStr} at ${quality}...`
-          : `Fetching your video${platformStr}, this can take a moment depending on size and quality.`
-  );
+  let statusMsg;
+  try {
+    statusMsg = await ctx.reply(
+      audioMode
+        ? `Extracting audio${platformStr}...`
+        : clip
+          ? `Fetching clip${platformStr} (${clip.startLabel} → ${clip.endLabel})...`
+          : quality
+            ? `Fetching your video${platformStr} at ${quality}...`
+            : `Fetching your video${platformStr}, this can take a moment depending on size and quality.`
+    );
+  } catch (error) {
+    try {
+      analytics.finishDownload(
+        analyticsDownloadId,
+        job.cancelled ? "cancelled" : "failed"
+      );
+    } catch (analyticsError) {
+      console.error("Failed to finalize analytics after status reply error:", analyticsError.message);
+    }
+    throw error;
+  }
 
   // Helper to safely edit the status message
   async function updateStatus(text) {
