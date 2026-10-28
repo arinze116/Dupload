@@ -9,6 +9,7 @@ const FormData = require('form-data');
 const { fetchVideo, downloadAudio, getVideoInfo, cleanup, MAX_FILE_SIZE_MB } = require('./downloader');
 const analytics = require('./analytics');
 const { createQueueScheduler } = require('./queue-scheduler');
+const { withRetry, trackUploadStream } = require('./upload-lifecycle');
 const {
   MAX_QUEUED_PER_CHAT,
   MAX_QUEUED_GLOBAL,
@@ -37,40 +38,56 @@ const localAgent = new http.Agent({
   keepAlive: true,
 });
 
-async function sendVideoDirect(chatId, filePath) {
+async function sendVideoDirect(chatId, filePath, job) {
   const form = new FormData();
+  const fileStream = fs.createReadStream(filePath);
+  const signal = job && job.abortController ? job.abortController.signal : undefined;
+  const cleanupStream = trackUploadStream(fileStream, signal);
   form.append('chat_id', String(chatId));
-  form.append('video', fs.createReadStream(filePath));
+  form.append('video', fileStream);
 
-  const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendVideo`, {
-    method: 'POST',
-    body: form,
-    agent: localAgent,
-  });
+  try {
+    const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendVideo`, {
+      method: 'POST',
+      body: form,
+      agent: localAgent,
+      signal,
+    });
 
-  const data = await res.json();
-  if (!data.ok) {
-    throw new Error(data.description || 'Telegram API returned an error');
+    const data = await res.json();
+    if (!data.ok) {
+      throw new Error(data.description || 'Telegram API returned an error');
+    }
+    return data;
+  } finally {
+    cleanupStream();
   }
-  return data;
 }
 
-async function sendAudioDirect(chatId, filePath) {
+async function sendAudioDirect(chatId, filePath, job) {
   const form = new FormData();
+  const fileStream = fs.createReadStream(filePath);
+  const signal = job && job.abortController ? job.abortController.signal : undefined;
+  const cleanupStream = trackUploadStream(fileStream, signal);
   form.append('chat_id', String(chatId));
-  form.append('audio', fs.createReadStream(filePath));
+  form.append('audio', fileStream);
 
-  const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendAudio`, {
-    method: 'POST',
-    body: form,
-    agent: localAgent,
-  });
+  try {
+    const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendAudio`, {
+      method: 'POST',
+      body: form,
+      agent: localAgent,
+      signal,
+    });
 
-  const data = await res.json();
-  if (!data.ok) {
-    throw new Error(data.description || 'Telegram API returned an error');
+    const data = await res.json();
+    if (!data.ok) {
+      throw new Error(data.description || 'Telegram API returned an error');
+    }
+    return data;
+  } finally {
+    cleanupStream();
   }
-  return data;
 }
 
 const bot = new Telegraf(BOT_TOKEN, {
@@ -238,35 +255,6 @@ function parseClipRequest(text) {
   };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withRetry(fn, options) {
-  const attempts = (options && options.attempts) || 3;
-  const baseDelayMs = (options && options.baseDelayMs) || 2000;
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-
-      // 413 means Telegram rejected the request because the upload is too large.
-      // Retrying the same file will not fix a permanent size error.
-      if (err.message && /Request Entity Too Large|413/.test(err.message)) {
-        throw err;
-      }
-
-      if (i < attempts - 1) {
-        const delay = baseDelayMs * Math.pow(2, i);
-        console.log(`Attempt ${i + 1} failed (${err.message}), retrying in ${delay}ms...`);
-        await sleep(delay);
-      }
-    }
-  }
-  throw lastErr;
-}
 
 /**
  * Processes a single download job.
@@ -307,7 +295,7 @@ function sanitizeDiagnosticText(value, originalUrl) {
 async function processJob(ctx, url, audioMode = false, quality = null, clip = null) {
   const chatId = ctx.chat.id;
   const jobId = crypto.randomBytes(6).toString('hex');
-  const job = { jobId, cancelled: false, proc: null };
+  const job = { jobId, cancelled: false, proc: null, abortController: new AbortController() };
   const analyticsDownloadId = analytics.startDownload(ctx.from?.id || chatId);
   activeJobs.set(chatId, job);
 
@@ -426,9 +414,15 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
 
   try {
     if (audioMode) {
-      await withRetry(() => sendAudioDirect(chatId, result.filePath));
+      await withRetry(
+        () => sendAudioDirect(chatId, result.filePath, job),
+        { job }
+      );
     } else {
-      await withRetry(() => sendVideoDirect(chatId, result.filePath));
+      await withRetry(
+        () => sendVideoDirect(chatId, result.filePath, job),
+        { job }
+      );
     }
 
     const fileSizeMB = fs.statSync(result.filePath).size / (1024 * 1024);
@@ -439,10 +433,20 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
       fileSizeMB
     );
   } catch (err) {
-    analytics.finishDownload(analyticsDownloadId, 'failed');
+    if (
+      job.cancelled ||
+      err.message === 'CANCELLED' ||
+      err.name === 'AbortError' ||
+      err.code === 'ABORT_ERR'
+    ) {
+      analytics.finishDownload(analyticsDownloadId, 'cancelled');
+      await updateStatus('Download cancelled.');
+    } else {
+      analytics.finishDownload(analyticsDownloadId, 'failed');
 
-    console.error(`[${jobId}] Send failed after retries:`, err.message);
-    await ctx.reply('Downloaded the file but the upload to Telegram kept failing. Try again or switch networks.');
+      console.error(`[${jobId}] Send failed after retries:`, err.message);
+      await ctx.reply('Downloaded the file but the upload to Telegram kept failing. Try again or switch networks.');
+    }
   } finally {
     cleanup(result.filePath);
   }
@@ -530,10 +534,26 @@ bot.command('stop', (ctx) => {
 
   if (job) {
     job.cancelled = true;
-    // Kill the yt-dlp child process immediately if it's running.
-    if (job.proc) {
+
+    // Abort an in-flight Telegram upload or cancellation-aware retry delay.
+    if (job.abortController) {
       try {
-        job.proc.kill('SIGKILL');
+        job.abortController.abort();
+      } catch (err) {
+        // The request may already have settled.
+      }
+    }
+
+    // Terminate every child process owned by this job.
+    const processes = job.processes instanceof Set
+      ? [...job.processes]
+      : job.proc ? [job.proc] : [];
+
+    for (const proc of processes) {
+      try {
+        if (proc.exitCode === null && proc.signalCode === null && !proc.killed) {
+          proc.kill('SIGKILL');
+        }
       } catch (err) {
         // Process may have already exited.
       }
