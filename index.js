@@ -8,6 +8,13 @@ const fetch = require('node-fetch');
 const FormData = require('form-data');
 const { fetchVideo, downloadAudio, getVideoInfo, cleanup, MAX_FILE_SIZE_MB } = require('./downloader');
 const analytics = require('./analytics');
+const { createQueueScheduler } = require('./queue-scheduler');
+const {
+  MAX_QUEUED_PER_CHAT,
+  MAX_QUEUED_GLOBAL,
+  MAX_ACTIVE_GLOBAL,
+  isQueueAtCapacity,
+} = require('./queue-policy');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -143,6 +150,7 @@ function isAdmin(ctx) {
 // job shape: { jobId, cancelled, proc (yt-dlp child process, if active) }
 const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
+
 
 function parseTimestamp(value) {
   const raw = String(value).trim();
@@ -427,25 +435,15 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
   }
 }
 
-/**
- * Runs the queue for a chat, one job at a time.
- */
-async function runQueue(chatId) {
-  const queue = jobQueues.get(chatId) || [];
-
-  while (queue.length > 0) {
-    const { url, ctx, audioMode, quality, clip } = queue.shift();
-    try {
-      await processJob(ctx, url, audioMode, quality, clip);
-    } catch (err) {
-      console.error('Unhandled error in processJob:', err.message);
-    } finally {
-      activeJobs.delete(chatId);
-    }
-  }
-
-  jobQueues.delete(chatId);
-}
+// Queue scheduling is isolated in a module with deterministic unit tests.
+const queueScheduler = createQueueScheduler({
+  jobQueues,
+  activeJobs,
+  processJob,
+  maxActive: MAX_ACTIVE_GLOBAL,
+});
+const runQueue = queueScheduler.runQueue;
+const runningQueues = queueScheduler.runningQueues;
 
 // --- Commands ---
 
@@ -485,6 +483,10 @@ bot.command('clip', async (ctx) => {
   const chatId = ctx.chat.id;
   const queue = jobQueues.get(chatId) || [];
 
+  if (isQueueAtCapacity(chatId, jobQueues)) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
+  }
+
   queue.push({
     url: request.url,
     ctx,
@@ -495,13 +497,13 @@ bot.command('clip', async (ctx) => {
 
   jobQueues.set(chatId, queue);
 
-  if (activeJobs.has(chatId)) {
+  if (runningQueues.has(chatId)) {
     return ctx.reply(
       `Clip added to queue (position ${queue.length}). Send /stop to cancel the current download.`
     );
   }
 
-  runQueue(chatId);
+  void runQueue(chatId);
 });
 
 bot.command('stop', (ctx) => {
@@ -509,26 +511,30 @@ bot.command('stop', (ctx) => {
   const job = activeJobs.get(chatId);
   const queue = jobQueues.get(chatId) || [];
 
-  if (!job && queue.length === 0) {
+  if (!job && queue.length === 0 && !runningQueues.has(chatId)) {
     return ctx.reply('No active download to stop.');
   }
 
   if (job) {
     job.cancelled = true;
-    // Kill the yt-dlp child process immediately if it's running
+    // Kill the yt-dlp child process immediately if it's running.
     if (job.proc) {
       try {
         job.proc.kill('SIGKILL');
       } catch (err) {
-        // Process may have already exited
+        // Process may have already exited.
       }
     }
   }
 
-  // Clear the queue
-  jobQueues.set(chatId, []);
+  const clearedCount = queue.length;
+  // Mutate the shared array so a runner awaiting a global slot sees the clear.
+  queue.length = 0;
+  jobQueues.set(chatId, queue);
 
-  const queueMsg = queue.length > 0 ? ` and cleared ${queue.length} queued link(s)` : '';
+  const queueMsg = clearedCount > 0
+    ? ` and cleared ${clearedCount} queued link(s)`
+    : '';
   ctx.reply(`Download stopped${queueMsg}.`);
 });
 
@@ -688,10 +694,14 @@ bot.on('text', async (ctx) => {
   const clip = clipRequest;
 
   const chatId = ctx.chat.id;
-  const isActive = activeJobs.has(chatId);
+  const isActive = runningQueues.has(chatId);
   const queue = jobQueues.get(chatId) || [];
 
   if (isActive) {
+    if (isQueueAtCapacity(chatId, jobQueues)) {
+      return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
+    }
+
     queue.push({ url, ctx, audioMode, quality, clip });
     jobQueues.set(chatId, queue);
 
@@ -700,10 +710,14 @@ bot.on('text', async (ctx) => {
     );
   }
 
+  if (isQueueAtCapacity(chatId, jobQueues)) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
+  }
+
   queue.push({ url, ctx, audioMode, quality, clip });
   jobQueues.set(chatId, queue);
 
-  runQueue(chatId);
+  void runQueue(chatId);
 });
 
 
