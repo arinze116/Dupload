@@ -7,7 +7,6 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const { fetchVideo, downloadAudio, getVideoInfo, cleanup, MAX_FILE_SIZE_MB } = require('./downloader');
-const { createSemaphore } = require('./global-semaphore');
 const analytics = require('./analytics');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -144,16 +143,6 @@ function isAdmin(ctx) {
 // job shape: { jobId, cancelled, proc (yt-dlp child process, if active) }
 const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
-const MAX_QUEUED_PER_CHAT = 5;
-const MAX_QUEUED_GLOBAL = 30;
-const MAX_ACTIVE_GLOBAL = 3;
-const globalSemaphore = createSemaphore(MAX_ACTIVE_GLOBAL);
-const runningQueues = new Set();
-
-function queueAtCapacity(chatId) {
-  const totalQueued = [...jobQueues.values()].reduce((total, queue) => total + queue.length, 0);
-  return (jobQueues.get(chatId) || []).length >= MAX_QUEUED_PER_CHAT || totalQueued >= MAX_QUEUED_GLOBAL;
-}
 
 function parseTimestamp(value) {
   const raw = String(value).trim();
@@ -277,6 +266,36 @@ async function withRetry(fn, options) {
  * 1. Setting job.cancelled = true
  * 2. Killing job.proc (the yt-dlp child process) if it's running
  */
+
+function sanitizeUrlForLog(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return '[unparseable URL]';
+  }
+}
+
+function sanitizeDiagnosticText(value, originalUrl) {
+  let text = String(value || '');
+
+  if (originalUrl) {
+    text = text.split(originalUrl).join(sanitizeUrlForLog(originalUrl));
+  }
+
+  return text.replace(/https?:\/\/[^\s"'<>]+/gi, (candidate) => {
+    try {
+      return sanitizeUrlForLog(candidate);
+    } catch {
+      return '[URL]';
+    }
+  });
+}
+
 async function processJob(ctx, url, audioMode = false, quality = null, clip = null) {
   const chatId = ctx.chat.id;
   const jobId = crypto.randomBytes(6).toString('hex');
@@ -344,7 +363,17 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
     }
 
     analytics.finishDownload(analyticsDownloadId, 'failed');
-    console.error(`[${jobId}] Download failed:`, err.message);
+    const safeUrl = sanitizeUrlForLog(url);
+    const safePlatform = String(platform || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '');
+    console.error(
+      `[${jobId}] Download failed [platform=${safePlatform}] [url=${safeUrl}]:`,
+      sanitizeDiagnosticText(err.message, url)
+    );
+    if (err.stack) {
+      console.error(
+        `[${jobId}] Download error stack:\n${sanitizeDiagnosticText(err.stack, url)}`
+      );
+    }
 
     if (err.message === 'CLIP_AUDIO_UNSUPPORTED') {
       await updateStatus(
@@ -399,58 +428,36 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
 }
 
 /**
- * Runs one queue per chat, while a shared semaphore caps process-wide work.
- * Queue items remain queued until a global slot is available, so queue limits
- * include jobs waiting for capacity.
+ * Runs the queue for a chat, one job at a time.
  */
 async function runQueue(chatId) {
-  if (runningQueues.has(chatId)) return;
-  runningQueues.add(chatId);
   const queue = jobQueues.get(chatId) || [];
 
-  try {
-    while (queue.length > 0) {
-      const releaseSlot = await globalSemaphore.acquire();
-
-      // /stop can clear a queue while its runner is waiting for a global slot.
-      if (queue.length === 0) {
-        releaseSlot();
-        break;
-      }
-
-      const { url, ctx, audioMode, quality, clip } = queue.shift();
-      try {
-        await processJob(ctx, url, audioMode, quality, clip);
-      } catch (err) {
-        console.error('Unhandled error in processJob:', err.message);
-      } finally {
-        activeJobs.delete(chatId);
-        releaseSlot();
-      }
-    }
-  } finally {
-    runningQueues.delete(chatId);
-    if (jobQueues.get(chatId) === queue) {
-      jobQueues.delete(chatId);
-    }
-    // Cover a new item arriving at the boundary of runner shutdown.
-    if ((jobQueues.get(chatId) || []).length > 0) {
-      void runQueue(chatId);
+  while (queue.length > 0) {
+    const { url, ctx, audioMode, quality, clip } = queue.shift();
+    try {
+      await processJob(ctx, url, audioMode, quality, clip);
+    } catch (err) {
+      console.error('Unhandled error in processJob:', err.message);
+    } finally {
+      activeJobs.delete(chatId);
     }
   }
+
+  jobQueues.delete(chatId);
 }
 
 // --- Commands ---
 
 bot.start((ctx) => {
   ctx.reply(
-    "Send me a video link from YouTube, TikTok, Instagram, X, Facebook, Reddit, Pinterest, or most other platforms and I'll download it.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading"
+    "Send me a video link from YouTube, TikTok, Instagram, X, Facebook, Reddit, Pinterest, or most other platforms and I'll download it.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\nFor video clips, use:\n/clip <start> <end> <url>\nExample: /clip 00:30 01:15 https://youtu.be/xxx\n\n/start — show bot instructions\n/help — show available commands\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading\n/clip <start> <end> <url> — download a specific video section"
   );
 });
 
 bot.help((ctx) => {
   ctx.reply(
-    "Paste any video link and I'll fetch the best quality available.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading"
+    "Paste any video link and I'll fetch the best quality available.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\nFor video clips, use:\n/clip <start> <end> <url>\nExample: /clip 00:30 01:15 https://youtu.be/xxx\n\n/start — show bot instructions\n/help — show available commands\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading\n/clip <start> <end> <url> — download a specific video section"
   );
 });
 
@@ -477,9 +484,6 @@ bot.command('clip', async (ctx) => {
 
   const chatId = ctx.chat.id;
   const queue = jobQueues.get(chatId) || [];
-  if (queueAtCapacity(chatId)) {
-    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
-  }
 
   queue.push({
     url: request.url,
@@ -491,7 +495,7 @@ bot.command('clip', async (ctx) => {
 
   jobQueues.set(chatId, queue);
 
-  if (runningQueues.has(chatId)) {
+  if (activeJobs.has(chatId)) {
     return ctx.reply(
       `Clip added to queue (position ${queue.length}). Send /stop to cancel the current download.`
     );
@@ -505,7 +509,7 @@ bot.command('stop', (ctx) => {
   const job = activeJobs.get(chatId);
   const queue = jobQueues.get(chatId) || [];
 
-  if (!job && queue.length === 0 && !runningQueues.has(chatId)) {
+  if (!job && queue.length === 0) {
     return ctx.reply('No active download to stop.');
   }
 
@@ -521,10 +525,8 @@ bot.command('stop', (ctx) => {
     }
   }
 
-  // Mutate the queue array the runner is consuming, so /stop also cancels
-  // queued items when that runner is waiting for a global concurrency slot.
-  queue.length = 0;
-  jobQueues.set(chatId, queue);
+  // Clear the queue
+  jobQueues.set(chatId, []);
 
   const queueMsg = queue.length > 0 ? ` and cleared ${queue.length} queued link(s)` : '';
   ctx.reply(`Download stopped${queueMsg}.`);
@@ -686,13 +688,10 @@ bot.on('text', async (ctx) => {
   const clip = clipRequest;
 
   const chatId = ctx.chat.id;
-  const isActive = runningQueues.has(chatId);
+  const isActive = activeJobs.has(chatId);
   const queue = jobQueues.get(chatId) || [];
 
   if (isActive) {
-    if (queueAtCapacity(chatId)) {
-      return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
-    }
     queue.push({ url, ctx, audioMode, quality, clip });
     jobQueues.set(chatId, queue);
 
@@ -701,9 +700,6 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  if (queueAtCapacity(chatId)) {
-    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat). Try again after a job finishes.`);
-  }
   queue.push({ url, ctx, audioMode, quality, clip });
   jobQueues.set(chatId, queue);
 
