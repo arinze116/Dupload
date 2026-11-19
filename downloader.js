@@ -1,9 +1,38 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { trackChildProcess, cancellationError } = require('./process-lifecycle');
+const { runWithTimeoutAndCancellation } = require('./network-lifecycle');
 
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || './downloads';
 const MAX_FILE_SIZE_MB = parseFloat(process.env.MAX_FILE_SIZE_MB || '50');
+
+const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES || '/home/ubuntu/cookies.txt';
+
+function getYouTubeCookieArgs(url) {
+  let hostname;
+
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return [];
+  }
+
+  const isYouTube =
+    hostname === 'youtube.com' ||
+    hostname.endsWith('.youtube.com') ||
+    hostname === 'youtu.be' ||
+    hostname === 'youtube-nocookie.com' ||
+    hostname.endsWith('.youtube-nocookie.com');
+
+  if (!isYouTube) return [];
+
+  if (!fs.existsSync(YOUTUBE_COOKIES)) {
+    throw new Error(`YouTube cookies file not found: ${YOUTUBE_COOKIES}`);
+  }
+
+  return ['--cookies', YOUTUBE_COOKIES];
+}
 
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -31,30 +60,46 @@ function qualityToFormatSelector(quality) {
   );
 }
 
-function runCommand(command, args, job) {
+function runCommand(command, args, job, options = {}) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(command, args);
-    if (job) job.proc = proc;
+    if (job && job.cancelled) return reject(cancellationError());
+
+    let proc;
+    try {
+      proc = spawn(command, args);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const tracking = trackChildProcess(proc, job, {
+      timeoutMs: options.timeoutMs || 10 * 60 * 1000,
+      label: options.label || command,
+    });
+
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (data) => (stdout += data.toString()));
-    proc.stderr.on('data', (data) => (stderr += data.toString()));
+    proc.stdout?.on('data', (data) => {
+      stdout += data.toString();
+    });
+    proc.stderr?.on('data', (data) => {
+      stderr += data.toString();
+    });
 
-    proc.on('close', (code) => {
-      if (job && job.proc === proc) job.proc = null;
-      if (job && job.cancelled) {
-        reject(new Error('CANCELLED'));
-      } else if (code === 0) {
+    proc.once('close', (code) => {
+      if (job && job.cancelled) return reject(cancellationError());
+      if (tracking.timedOut) return reject(tracking.timeoutError());
+
+      if (code === 0) {
         resolve(stdout);
       } else {
         reject(new Error(stderr || `${command} exited with code ${code}`));
       }
     });
 
-    proc.on('error', (err) => {
-      if (job && job.proc === proc) job.proc = null;
-      reject(err);
+    proc.once('error', (error) => {
+      reject(error);
     });
   });
 }
@@ -64,8 +109,10 @@ function runCommand(command, args, job) {
  * Some TikTok CDN variants claim an audio codec in their metadata but
  * are silent in practice — this catches that.
  */
-function hasAudioStream(filePath) {
-  return new Promise((resolve) => {
+function hasAudioStream(filePath, job) {
+  return new Promise((resolve, reject) => {
+    if (job && job.cancelled) return reject(cancellationError());
+
     const proc = spawn('ffprobe', [
       '-v', 'error',
       '-select_streams', 'a',
@@ -73,10 +120,29 @@ function hasAudioStream(filePath) {
       '-of', 'csv=p=0',
       filePath,
     ]);
+
+    const tracking = trackChildProcess(proc, job, {
+      timeoutMs: 30_000,
+      label: 'ffprobe audio-stream check',
+    });
+
     let stdout = '';
-    proc.stdout.on('data', (d) => (stdout += d.toString()));
-    proc.on('close', () => resolve(stdout.trim().length > 0));
-    proc.on('error', () => resolve(true)); // fail open — don't block on probe errors
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.once('close', () => {
+      if (job && job.cancelled) return reject(cancellationError());
+      if (tracking.timedOut) return reject(tracking.timeoutError());
+      resolve(stdout.trim().length > 0);
+    });
+
+    proc.once('error', (error) => {
+      if (job && job.cancelled) return reject(cancellationError());
+      // Preserve the existing fail-open behavior for ordinary probe errors.
+      console.error('Audio-stream probe failed:', error.message);
+      resolve(true);
+    });
   });
 }
 
@@ -99,6 +165,8 @@ async function downloadVideo(url, jobId, job, onProgress, quality = null) {
     : 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best';
 
   const args = [
+    '--remote-components', 'ejs:github',
+    ...getYouTubeCookieArgs(url),
     '-f', formatSelector,
     '--no-playlist',
     '--merge-output-format', 'mp4',
@@ -112,9 +180,12 @@ async function downloadVideo(url, jobId, job, onProgress, quality = null) {
   ];
 
   return new Promise((resolve, reject) => {
+    if (job && job.cancelled) return reject(cancellationError());
     const proc = spawn('yt-dlp', args);
-
-    if (job) job.proc = proc;
+    const tracking = trackChildProcess(proc, job, {
+      timeoutMs: 15 * 60 * 1000,
+      label: 'yt-dlp video download',
+    });
 
     let stderr = '';
     let lastProgressUpdate = 0;
@@ -157,11 +228,9 @@ async function downloadVideo(url, jobId, job, onProgress, quality = null) {
 
     proc.on('close', (code) => {
       if (progressTimer) clearInterval(progressTimer);
-      if (job) job.proc = null;
 
-      if (job && job.cancelled) {
-        return reject(new Error('CANCELLED'));
-      }
+      if (job && job.cancelled) return reject(cancellationError());
+      if (tracking.timedOut) return reject(tracking.timeoutError());
 
       if (code === 0) {
         const files = fs.readdirSync(DOWNLOAD_DIR).filter(
@@ -190,6 +259,8 @@ async function downloadAudio(url, jobId, job, onProgress) {
   const outputPath = path.join(DOWNLOAD_DIR, `${jobId}.mp3`);
 
   const args = [
+    '--remote-components', 'ejs:github',
+    ...getYouTubeCookieArgs(url),
     '-f', 'bestaudio',
     '--no-playlist',
     '--extract-audio',
@@ -201,8 +272,12 @@ async function downloadAudio(url, jobId, job, onProgress) {
   ];
 
   return new Promise((resolve, reject) => {
+    if (job && job.cancelled) return reject(cancellationError());
     const proc = spawn('yt-dlp', args);
-    if (job) job.proc = proc;
+    const tracking = trackChildProcess(proc, job, {
+      timeoutMs: 15 * 60 * 1000,
+      label: 'yt-dlp audio download',
+    });
 
     let stderr = '';
     let lastProgressUpdate = 0;
@@ -245,9 +320,9 @@ async function downloadAudio(url, jobId, job, onProgress) {
 
     proc.on('close', (code) => {
       if (progressTimer) clearInterval(progressTimer);
-      if (job) job.proc = null;
 
-      if (job && job.cancelled) return reject(new Error('CANCELLED'));
+      if (job && job.cancelled) return reject(cancellationError());
+      if (tracking.timedOut) return reject(tracking.timeoutError());
 
       if (code === 0) {
         // yt-dlp may append .mp3 to the output path or not — find it
@@ -279,6 +354,7 @@ async function fixMissingAudio(videoPath, url, jobId, job) {
   const muxedPath = path.join(DOWNLOAD_DIR, `${jobId}_muxed.mp4`);
 
   await runCommand('yt-dlp', [
+    '--remote-components', 'ejs:github',
     '-f', 'download',
     '--no-playlist',
     '-o', audioSourcePath,
@@ -308,8 +384,10 @@ function getFileSizeMB(filePath) {
   return stats.size / (1024 * 1024);
 }
 
-async function getMediaDuration(filePath) {
+async function getMediaDuration(filePath, job) {
   return new Promise((resolve, reject) => {
+    if (job && job.cancelled) return reject(cancellationError());
+
     const proc = spawn('ffprobe', [
       '-v', 'error',
       '-show_entries', 'format=duration',
@@ -317,24 +395,29 @@ async function getMediaDuration(filePath) {
       filePath,
     ]);
 
+    const tracking = trackChildProcess(proc, job, {
+      timeoutMs: 30_000,
+      label: 'ffprobe media duration',
+    });
+
     let stdout = '';
     let stderr = '';
 
     proc.stdout.on('data', (data) => {
       stdout += data.toString();
     });
-
     proc.stderr.on('data', (data) => {
       stderr += data.toString();
     });
 
-    proc.on('close', (code) => {
+    proc.once('close', (code) => {
+      if (job && job.cancelled) return reject(cancellationError());
+      if (tracking.timedOut) return reject(tracking.timeoutError());
       if (code !== 0) {
         return reject(new Error(stderr || 'ffprobe duration check failed'));
       }
 
       const duration = parseFloat(stdout.trim());
-
       if (!Number.isFinite(duration) || duration < 0) {
         return reject(new Error('Could not determine media duration.'));
       }
@@ -342,7 +425,9 @@ async function getMediaDuration(filePath) {
       resolve(duration);
     });
 
-    proc.on('error', reject);
+    proc.once('error', (error) => {
+      reject(error);
+    });
   });
 }
 
@@ -399,8 +484,13 @@ async function compressVideo(inputPath, jobId, job) {
 
 async function downloadTikTokViaAPI(url, jobId, job) {
   const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`;
-  const response = await fetch(apiUrl);
-  const json = await response.json();
+  const json = await runWithTimeoutAndCancellation(async (signal) => {
+    const response = await fetch(apiUrl, { signal });
+    return response.json();
+  }, job, {
+    timeoutMs: 30_000,
+    label: 'TikTok API request',
+  });
 
   if (json.code !== 0 || !json.data?.play) {
     throw new Error(`TikTok API error: ${json.msg || 'No video found'}`);
@@ -419,26 +509,37 @@ async function downloadTikTokViaAPI(url, jobId, job) {
 async function getVideoInfo(url) {
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', [
+      '--remote-components', 'ejs:github',
+      ...getYouTubeCookieArgs(url),
       '--dump-json',
       '--no-playlist',
       '--no-download',
       url,
     ]);
 
+    const tracking = trackChildProcess(proc, null, {
+      timeoutMs: 60_000,
+      label: 'yt-dlp video metadata',
+    });
+
     let stdout = '';
     let stderr = '';
-    proc.stdout.on('data', (d) => (stdout += d.toString()));
-    proc.stderr.on('data', (d) => (stderr += d.toString()));
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
 
-    proc.on('close', (code) => {
+    proc.once('close', (code) => {
+      if (tracking.timedOut) return reject(tracking.timeoutError());
       if (code !== 0) return reject(new Error(stderr || 'yt-dlp info failed'));
 
       try {
         const data = JSON.parse(stdout);
-        // Extract unique height values from formats, filter nulls, sort descending
         const heights = [...new Set(
           (data.formats || [])
-            .map((f) => f.height)
+            .map((format) => format.height)
             .filter(Boolean)
         )].sort((a, b) => b - a);
 
@@ -446,14 +547,14 @@ async function getVideoInfo(url) {
           title: data.title || 'Unknown',
           uploader: data.uploader || data.channel || null,
           duration: data.duration || null,
-          formats: heights.length > 0 ? heights.map((h) => `${h}p`) : ['unknown'],
+          formats: heights.length > 0 ? heights.map((height) => `${height}p`) : ['unknown'],
         });
-      } catch (e) {
+      } catch {
         reject(new Error('Failed to parse video info'));
       }
     });
 
-    proc.on('error', reject);
+    proc.once('error', reject);
   });
 }
 
@@ -461,7 +562,7 @@ async function getVideoInfo(url) {
  * Full pipeline: download, fix audio if needed, then compress if needed.
  * Returns { filePath, wasCompressed, finalSizeMB }
  */
-async function fetchVideo(
+async function fetchVideoPipeline(
   url,
   jobId,
   job,
@@ -502,7 +603,7 @@ async function fetchVideo(
     throw new Error('CANCELLED');
   }
 
-  const audioOk = await hasAudioStream(originalPath);
+  const audioOk = await hasAudioStream(originalPath, job);
 
   if (!audioOk) {
     if (onProgress) {
@@ -516,7 +617,7 @@ async function fetchVideo(
     const sourcePath = originalPath;
 
     try {
-      const mediaDuration = await getMediaDuration(sourcePath);
+      const mediaDuration = await getMediaDuration(sourcePath, job);
 
       if (clip.end > mediaDuration + 0.5) {
         throw new Error(
@@ -583,6 +684,46 @@ async function fetchVideo(
     wasCompressed: true,
     finalSizeMB: compressedSizeMB,
   };
+}
+
+async function fetchVideo(
+  url,
+  jobId,
+  job,
+  onProgress,
+  audioMode = false,
+  quality = null,
+  clip = null
+) {
+  try {
+    return await fetchVideoPipeline(
+      url,
+      jobId,
+      job,
+      onProgress,
+      audioMode,
+      quality,
+      clip
+    );
+  } catch (error) {
+    cleanupJobFiles(jobId);
+    throw error;
+  }
+}
+
+function cleanupJobFiles(jobId) {
+  try {
+    const prefix = String(jobId);
+    const files = fs.readdirSync(DOWNLOAD_DIR).filter(
+      (file) => file.startsWith(`${prefix}.`) || file.startsWith(`${prefix}_`)
+    );
+
+    for (const file of files) {
+      cleanup(path.join(DOWNLOAD_DIR, file));
+    }
+  } catch (error) {
+    // Preserve the original pipeline error if directory cleanup fails.
+  }
 }
 
 function cleanup(filePath) {

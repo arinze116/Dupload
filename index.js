@@ -7,8 +7,15 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
 const { fetchVideo, downloadAudio, getVideoInfo, cleanup, MAX_FILE_SIZE_MB } = require('./downloader');
-const { createSemaphore } = require('./global-semaphore');
 const analytics = require('./analytics');
+const { createQueueScheduler } = require('./queue-scheduler');
+const { withRetry, trackUploadStream } = require('./upload-lifecycle');
+const {
+  MAX_QUEUED_PER_CHAT,
+  MAX_QUEUED_GLOBAL,
+  MAX_ACTIVE_GLOBAL,
+  isQueueAtCapacity,
+} = require('./queue-policy');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -31,40 +38,56 @@ const localAgent = new http.Agent({
   keepAlive: true,
 });
 
-async function sendVideoDirect(chatId, filePath) {
+async function sendVideoDirect(chatId, filePath, job) {
   const form = new FormData();
+  const fileStream = fs.createReadStream(filePath);
+  const signal = job && job.abortController ? job.abortController.signal : undefined;
+  const cleanupStream = trackUploadStream(fileStream, signal);
   form.append('chat_id', String(chatId));
-  form.append('video', fs.createReadStream(filePath));
+  form.append('video', fileStream);
 
-  const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendVideo`, {
-    method: 'POST',
-    body: form,
-    agent: localAgent,
-  });
+  try {
+    const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendVideo`, {
+      method: 'POST',
+      body: form,
+      agent: localAgent,
+      signal,
+    });
 
-  const data = await res.json();
-  if (!data.ok) {
-    throw new Error(data.description || 'Telegram API returned an error');
+    const data = await res.json();
+    if (!data.ok) {
+      throw new Error(data.description || 'Telegram API returned an error');
+    }
+    return data;
+  } finally {
+    cleanupStream();
   }
-  return data;
 }
 
-async function sendAudioDirect(chatId, filePath) {
+async function sendAudioDirect(chatId, filePath, job) {
   const form = new FormData();
+  const fileStream = fs.createReadStream(filePath);
+  const signal = job && job.abortController ? job.abortController.signal : undefined;
+  const cleanupStream = trackUploadStream(fileStream, signal);
   form.append('chat_id', String(chatId));
-  form.append('audio', fs.createReadStream(filePath));
+  form.append('audio', fileStream);
 
-  const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendAudio`, {
-    method: 'POST',
-    body: form,
-    agent: localAgent,
-  });
+  try {
+    const res = await fetch(`${LOCAL_API_URL}/bot${BOT_TOKEN}/sendAudio`, {
+      method: 'POST',
+      body: form,
+      agent: localAgent,
+      signal,
+    });
 
-  const data = await res.json();
-  if (!data.ok) {
-    throw new Error(data.description || 'Telegram API returned an error');
+    const data = await res.json();
+    if (!data.ok) {
+      throw new Error(data.description || 'Telegram API returned an error');
+    }
+    return data;
+  } finally {
+    cleanupStream();
   }
-  return data;
 }
 
 const bot = new Telegraf(BOT_TOKEN, {
@@ -144,16 +167,7 @@ function isAdmin(ctx) {
 // job shape: { jobId, cancelled, proc (yt-dlp child process, if active) }
 const activeJobs = new Map();  // chatId -> job
 const jobQueues = new Map();   // chatId -> Array of { url, ctx, audioMode, quality, clip }
-const MAX_QUEUED_PER_CHAT = 5;
-const MAX_QUEUED_GLOBAL = 30;
-const MAX_ACTIVE_GLOBAL = 3;
-const globalSemaphore = createSemaphore(MAX_ACTIVE_GLOBAL);
-const runningQueues = new Set();
 
-function queueAtCapacity(chatId) {
-  const totalQueued = [...jobQueues.values()].reduce((total, queue) => total + queue.length, 0);
-  return (jobQueues.get(chatId) || []).length >= MAX_QUEUED_PER_CHAT || totalQueued >= MAX_QUEUED_GLOBAL;
-}
 
 function parseTimestamp(value) {
   const raw = String(value).trim();
@@ -241,35 +255,6 @@ function parseClipRequest(text) {
   };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withRetry(fn, options) {
-  const attempts = (options && options.attempts) || 3;
-  const baseDelayMs = (options && options.baseDelayMs) || 2000;
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-
-      // 413 means Telegram rejected the request because the upload is too large.
-      // Retrying the same file will not fix a permanent size error.
-      if (err.message && /Request Entity Too Large|413/.test(err.message)) {
-        throw err;
-      }
-
-      if (i < attempts - 1) {
-        const delay = baseDelayMs * Math.pow(2, i);
-        console.log(`Attempt ${i + 1} failed (${err.message}), retrying in ${delay}ms...`);
-        await sleep(delay);
-      }
-    }
-  }
-  throw lastErr;
-}
 
 /**
  * Processes a single download job.
@@ -277,25 +262,68 @@ async function withRetry(fn, options) {
  * 1. Setting job.cancelled = true
  * 2. Killing job.proc (the yt-dlp child process) if it's running
  */
+
+function sanitizeUrlForLog(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return '[unparseable URL]';
+  }
+}
+
+function sanitizeDiagnosticText(value, originalUrl) {
+  let text = String(value || '');
+
+  if (originalUrl) {
+    text = text.split(originalUrl).join(sanitizeUrlForLog(originalUrl));
+  }
+
+  return text.replace(/https?:\/\/[^\s"'<>]+/gi, (candidate) => {
+    try {
+      return sanitizeUrlForLog(candidate);
+    } catch {
+      return '[URL]';
+    }
+  });
+}
+
 async function processJob(ctx, url, audioMode = false, quality = null, clip = null) {
   const chatId = ctx.chat.id;
   const jobId = crypto.randomBytes(6).toString('hex');
-  const job = { jobId, cancelled: false, proc: null };
+  const job = { jobId, cancelled: false, proc: null, abortController: new AbortController() };
   const analyticsDownloadId = analytics.startDownload(ctx.from?.id || chatId);
   activeJobs.set(chatId, job);
 
   const platform = detectPlatform(url);
   const platformStr = platform ? ` from ${platform}` : '';
 
-  const statusMsg = await ctx.reply(
-    audioMode
-      ? `Extracting audio${platformStr}...`
-      : clip
-        ? `Fetching clip${platformStr} (${clip.startLabel} → ${clip.endLabel})...`
-        : quality
-          ? `Fetching your video${platformStr} at ${quality}...`
-          : `Fetching your video${platformStr}, this can take a moment depending on size and quality.`
-  );
+  let statusMsg;
+  try {
+    statusMsg = await ctx.reply(
+      audioMode
+        ? `Extracting audio${platformStr}...`
+        : clip
+          ? `Fetching clip${platformStr} (${clip.startLabel} → ${clip.endLabel})...`
+          : quality
+            ? `Fetching your video${platformStr} at ${quality}...`
+            : `Fetching your video${platformStr}, this can take a moment depending on size and quality.`
+    );
+  } catch (error) {
+    try {
+      analytics.finishDownload(
+        analyticsDownloadId,
+        job.cancelled ? "cancelled" : "failed"
+      );
+    } catch (analyticsError) {
+      console.error("Failed to finalize analytics after status reply error:", analyticsError.message);
+    }
+    throw error;
+  }
 
   // Helper to safely edit the status message
   async function updateStatus(text) {
@@ -344,7 +372,17 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
     }
 
     analytics.finishDownload(analyticsDownloadId, 'failed');
-    console.error(`[${jobId}] Download failed:`, err.message);
+    const safeUrl = sanitizeUrlForLog(url);
+    const safePlatform = String(platform || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '');
+    console.error(
+      `[${jobId}] Download failed [platform=${safePlatform}] [url=${safeUrl}]:`,
+      sanitizeDiagnosticText(err.message, url)
+    );
+    if (err.stack) {
+      console.error(
+        `[${jobId}] Download error stack:\n${sanitizeDiagnosticText(err.stack, url)}`
+      );
+    }
 
     if (err.message === 'CLIP_AUDIO_UNSUPPORTED') {
       await updateStatus(
@@ -376,9 +414,15 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
 
   try {
     if (audioMode) {
-      await withRetry(() => sendAudioDirect(chatId, result.filePath));
+      await withRetry(
+        () => sendAudioDirect(chatId, result.filePath, job),
+        { job }
+      );
     } else {
-      await withRetry(() => sendVideoDirect(chatId, result.filePath));
+      await withRetry(
+        () => sendVideoDirect(chatId, result.filePath, job),
+        { job }
+      );
     }
 
     const fileSizeMB = fs.statSync(result.filePath).size / (1024 * 1024);
@@ -389,68 +433,46 @@ async function processJob(ctx, url, audioMode = false, quality = null, clip = nu
       fileSizeMB
     );
   } catch (err) {
-    analytics.finishDownload(analyticsDownloadId, 'failed');
+    if (
+      job.cancelled ||
+      err.message === 'CANCELLED' ||
+      err.name === 'AbortError' ||
+      err.code === 'ABORT_ERR'
+    ) {
+      analytics.finishDownload(analyticsDownloadId, 'cancelled');
+      await updateStatus('Download cancelled.');
+    } else {
+      analytics.finishDownload(analyticsDownloadId, 'failed');
 
-    console.error(`[${jobId}] Send failed after retries:`, err.message);
-    await ctx.reply('Downloaded the file but the upload to Telegram kept failing. Try again or switch networks.');
+      console.error(`[${jobId}] Send failed after retries:`, err.message);
+      await ctx.reply('Downloaded the file but the upload to Telegram kept failing. Try again or switch networks.');
+    }
   } finally {
     cleanup(result.filePath);
   }
 }
 
-/**
- * Runs one queue per chat, while a shared semaphore caps process-wide work.
- * Queue items remain queued until a global slot is available, so queue limits
- * include jobs waiting for capacity.
- */
-async function runQueue(chatId) {
-  if (runningQueues.has(chatId)) return;
-  runningQueues.add(chatId);
-  const queue = jobQueues.get(chatId) || [];
-
-  try {
-    while (queue.length > 0) {
-      const releaseSlot = await globalSemaphore.acquire();
-
-      // /stop can clear a queue while its runner is waiting for a global slot.
-      if (queue.length === 0) {
-        releaseSlot();
-        break;
-      }
-
-      const { url, ctx, audioMode, quality, clip } = queue.shift();
-      try {
-        await processJob(ctx, url, audioMode, quality, clip);
-      } catch (err) {
-        console.error('Unhandled error in processJob:', err.message);
-      } finally {
-        activeJobs.delete(chatId);
-        releaseSlot();
-      }
-    }
-  } finally {
-    runningQueues.delete(chatId);
-    if (jobQueues.get(chatId) === queue) {
-      jobQueues.delete(chatId);
-    }
-    // Cover a new item arriving at the boundary of runner shutdown.
-    if ((jobQueues.get(chatId) || []).length > 0) {
-      void runQueue(chatId);
-    }
-  }
-}
+// Queue scheduling is isolated in a module with deterministic unit tests.
+const queueScheduler = createQueueScheduler({
+  jobQueues,
+  activeJobs,
+  processJob,
+  maxActive: MAX_ACTIVE_GLOBAL,
+});
+const runQueue = queueScheduler.runQueue;
+const runningQueues = queueScheduler.runningQueues;
 
 // --- Commands ---
 
 bot.start((ctx) => {
   ctx.reply(
-    "Send me a video link from YouTube, TikTok, Instagram, X, Facebook, Reddit, Pinterest, or most other platforms and I'll download it.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading"
+    "Send me a video link from YouTube, TikTok, Instagram, X, Facebook, Reddit, Pinterest, or most other platforms and I'll download it.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\nFor video clips, use:\n/clip <start> <end> <url>\nExample: /clip 00:30 01:15 https://youtu.be/xxx\n\n/start — show bot instructions\n/help — show available commands\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading\n/clip <start> <end> <url> — download a specific video section"
   );
 });
 
 bot.help((ctx) => {
   ctx.reply(
-    "Paste any video link and I'll fetch the best quality available.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading"
+    "Paste any video link and I'll fetch the best quality available.\n\nFor audio only, add the word 'audio' to your message.\nExample: audio https://youtu.be/xxx\n\nFor video clips, use:\n/clip <start> <end> <url>\nExample: /clip 00:30 01:15 https://youtu.be/xxx\n\n/start — show bot instructions\n/help — show available commands\n/stop — cancel current download\n/queue — check download queue\n/info <url> — preview video info before downloading\n/clip <start> <end> <url> — download a specific video section"
   );
 });
 
@@ -477,7 +499,8 @@ bot.command('clip', async (ctx) => {
 
   const chatId = ctx.chat.id;
   const queue = jobQueues.get(chatId) || [];
-  if (queueAtCapacity(chatId)) {
+
+  if (isQueueAtCapacity(chatId, jobQueues)) {
     return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
   }
 
@@ -497,7 +520,7 @@ bot.command('clip', async (ctx) => {
     );
   }
 
-  runQueue(chatId);
+  void runQueue(chatId);
 });
 
 bot.command('stop', (ctx) => {
@@ -511,22 +534,40 @@ bot.command('stop', (ctx) => {
 
   if (job) {
     job.cancelled = true;
-    // Kill the yt-dlp child process immediately if it's running
-    if (job.proc) {
+
+    // Abort an in-flight Telegram upload or cancellation-aware retry delay.
+    if (job.abortController) {
       try {
-        job.proc.kill('SIGKILL');
+        job.abortController.abort();
       } catch (err) {
-        // Process may have already exited
+        // The request may already have settled.
+      }
+    }
+
+    // Terminate every child process owned by this job.
+    const processes = job.processes instanceof Set
+      ? [...job.processes]
+      : job.proc ? [job.proc] : [];
+
+    for (const proc of processes) {
+      try {
+        if (proc.exitCode === null && proc.signalCode === null && !proc.killed) {
+          proc.kill('SIGKILL');
+        }
+      } catch (err) {
+        // Process may have already exited.
       }
     }
   }
 
-  // Mutate the queue array the runner is consuming, so /stop also cancels
-  // queued items when that runner is waiting for a global concurrency slot.
+  const clearedCount = queue.length;
+  // Mutate the shared array so a runner awaiting a global slot sees the clear.
   queue.length = 0;
   jobQueues.set(chatId, queue);
 
-  const queueMsg = queue.length > 0 ? ` and cleared ${queue.length} queued link(s)` : '';
+  const queueMsg = clearedCount > 0
+    ? ` and cleared ${clearedCount} queued link(s)`
+    : '';
   ctx.reply(`Download stopped${queueMsg}.`);
 });
 
@@ -690,9 +731,10 @@ bot.on('text', async (ctx) => {
   const queue = jobQueues.get(chatId) || [];
 
   if (isActive) {
-    if (queueAtCapacity(chatId)) {
+    if (isQueueAtCapacity(chatId, jobQueues)) {
       return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
     }
+
     queue.push({ url, ctx, audioMode, quality, clip });
     jobQueues.set(chatId, queue);
 
@@ -701,13 +743,14 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  if (queueAtCapacity(chatId)) {
-    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat). Try again after a job finishes.`);
+  if (isQueueAtCapacity(chatId, jobQueues)) {
+    return ctx.reply(`Queue is full (maximum ${MAX_QUEUED_PER_CHAT} waiting links per chat and ${MAX_QUEUED_GLOBAL} globally). Try again after a job finishes.`);
   }
+
   queue.push({ url, ctx, audioMode, quality, clip });
   jobQueues.set(chatId, queue);
 
-  runQueue(chatId);
+  void runQueue(chatId);
 });
 
 

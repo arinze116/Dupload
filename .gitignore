@@ -1,15 +1,20 @@
 node_modules/
 
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 
+# Runtime data and generated files
 data/
-
 downloads/*
 !downloads/.gitkeep
-
 *.log
 
+# Cookies and local credentials
 instagram_cookies.txt
 youtube_cookies.txt
+
+# Local backups
+*.before-*
+backup-analytics-*/
