@@ -7,6 +7,33 @@ const { runWithTimeoutAndCancellation } = require('./network-lifecycle');
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || './downloads';
 const MAX_FILE_SIZE_MB = parseFloat(process.env.MAX_FILE_SIZE_MB || '50');
 
+const YOUTUBE_COOKIES = process.env.YOUTUBE_COOKIES || '/home/ubuntu/cookies.txt';
+
+function getYouTubeCookieArgs(url) {
+  let hostname;
+
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return [];
+  }
+
+  const isYouTube =
+    hostname === 'youtube.com' ||
+    hostname.endsWith('.youtube.com') ||
+    hostname === 'youtu.be' ||
+    hostname === 'youtube-nocookie.com' ||
+    hostname.endsWith('.youtube-nocookie.com');
+
+  if (!isYouTube) return [];
+
+  if (!fs.existsSync(YOUTUBE_COOKIES)) {
+    throw new Error(`YouTube cookies file not found: ${YOUTUBE_COOKIES}`);
+  }
+
+  return ['--cookies', YOUTUBE_COOKIES];
+}
+
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
@@ -139,6 +166,7 @@ async function downloadVideo(url, jobId, job, onProgress, quality = null) {
 
   const args = [
     '--remote-components', 'ejs:github',
+    ...getYouTubeCookieArgs(url),
     '-f', formatSelector,
     '--no-playlist',
     '--merge-output-format', 'mp4',
@@ -232,6 +260,7 @@ async function downloadAudio(url, jobId, job, onProgress) {
 
   const args = [
     '--remote-components', 'ejs:github',
+    ...getYouTubeCookieArgs(url),
     '-f', 'bestaudio',
     '--no-playlist',
     '--extract-audio',
@@ -481,6 +510,7 @@ async function getVideoInfo(url) {
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', [
       '--remote-components', 'ejs:github',
+      ...getYouTubeCookieArgs(url),
       '--dump-json',
       '--no-playlist',
       '--no-download',
